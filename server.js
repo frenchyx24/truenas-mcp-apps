@@ -6,6 +6,10 @@ const TRUENAS_API_KEY = process.env.TRUENAS_API_KEY || '';
 const TRUENAS_INSECURE = process.env.TRUENAS_INSECURE === 'true';
 const PORT = Number(process.env.PORT) || 3004;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
+const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
+function dockerRequest(method,path,body){return new Promise((resolve,reject)=>{const req=http.request({socketPath:DOCKER_SOCKET,path,method,headers:{'Content-Type':'application/json'}},res=>{const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>{const text=Buffer.concat(chunks).toString();let data;try{data=JSON.parse(text)}catch{data=text}resolve({status:res.statusCode,data})})});req.on('error',reject);if(body)req.write(JSON.stringify(body));req.end()})}
+async function dockerExec(container,command){const created=await dockerRequest('POST','/containers/'+encodeURIComponent(container)+'/exec',{AttachStdout:true,AttachStderr:true,Cmd:Array.isArray(command)?command:['sh','-c',command]});if(created.status!==201)throw new Error('Exec create failed: '+JSON.stringify(created.data));const id=created.data.Id;const started=await dockerRequest('POST','/exec/'+id+'/start',{Detach:false,Tty:true});if(started.status!==200)throw new Error('Exec start failed: '+JSON.stringify(started.data));const inspected=await dockerRequest('GET','/exec/'+id+'/json');return{output:typeof started.data==='string'?started.data:JSON.stringify(started.data),exitCode:inspected.data?.ExitCode??null}}
+
 
 if (TRUENAS_INSECURE) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
@@ -229,6 +233,11 @@ const TOOLS = [
     handler: (a) => rpcJob('app.rollback', [a.app_name, { app_version: a.app_version }]),
   },
 
+  { name:'container_list',description:'List all Docker containers.',inputSchema:{type:'object',properties:{}},handler:async()=>{const r=await dockerRequest('GET','/containers/json?all=true');if(r.status!==200)throw new Error(JSON.stringify(r.data));return r.data.map(c=>({id:c.Id.slice(0,12),name:(c.Names[0]||'').replace(/^\//,''),image:c.Image,state:c.State,status:c.Status}))} },
+  { name:'container_exec',description:'Execute a shell command inside a running container.',inputSchema:{type:'object',properties:{container:{type:'string'},command:{type:'string'}},required:['container','command']},handler:a=>dockerExec(a.container,a.command) },
+  { name:'container_file_read',description:'Read a file inside a running container.',inputSchema:{type:'object',properties:{container:{type:'string'},path:{type:'string'}},required:['container','path']},handler:a=>dockerExec(a.container,['cat',a.path]) },
+  { name:'container_file_write',description:'Write text to a file inside a running container.',inputSchema:{type:'object',properties:{container:{type:'string'},path:{type:'string'},content:{type:'string'}},required:['container','path','content']},handler:a=>dockerExec(a.container,['sh','-c','printf %s '+JSON.stringify(a.content)+' > '+JSON.stringify(a.path)]) },
+  { name:'container_file_list',description:'List files in a directory inside a running container.',inputSchema:{type:'object',properties:{container:{type:'string'},path:{type:'string'}},required:['container','path']},handler:a=>dockerExec(a.container,['ls','-la',a.path]) },
   // Datasets
   {
     name: 'dataset_list',
@@ -448,7 +457,7 @@ async function handleRPC(body) {
     return mcpResult({
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'truenas-mcp-apps', version: '2.0.0' },
+      serverInfo: { name: 'truenas-mcp-apps', version: '3.0.0' },
     }, id);
   }
 
