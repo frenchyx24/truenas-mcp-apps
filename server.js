@@ -1,26 +1,106 @@
 import http from 'node:http';
+import { WebSocket } from 'ws';
 
-const TRUENAS_URL = process.env.TRUENAS_URL || 'http://192.168.1.17';
-const TRUENAS_TOKEN = process.env.TRUENAS_TOKEN || '';
+const TRUENAS_HOST = process.env.TRUENAS_HOST || '192.168.1.17:4545';
+const TRUENAS_API_KEY = process.env.TRUENAS_API_KEY || '';
+const TRUENAS_INSECURE = process.env.TRUENAS_INSECURE === 'true';
 const PORT = Number(process.env.PORT) || 3004;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 
-// --- TrueNAS API client ---
+if (TRUENAS_INSECURE) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-async function truenas(method, path, body) {
-  const url = `${TRUENAS_URL}/api/v2.0${path}`;
-  const opts = {
-    method,
-    headers: {
-      'Authorization': `Bearer ${TRUENAS_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-  };
-  if (body !== undefined) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  if (!res.ok) throw new Error(`TrueNAS ${res.status}: ${text.slice(0, 500)}`);
-  try { return JSON.parse(text); } catch { return text; }
+// --- TrueNAS WebSocket JSON-RPC client ---
+
+let ws = null;
+let wsReady = false;
+let rpcId = 0;
+const pending = new Map();
+let authenticated = false;
+
+function connect() {
+  const url = `wss://${TRUENAS_HOST}/api/current`;
+  console.log(`Connecting to ${url}`);
+  ws = new WebSocket(url, { rejectUnauthorized: !TRUENAS_INSECURE });
+
+  ws.on('open', async () => {
+    console.log('WebSocket connected, authenticating...');
+    try {
+      await rpcCall('auth.login_with_api_key', [TRUENAS_API_KEY]);
+      authenticated = true;
+      wsReady = true;
+      console.log('Authenticated successfully');
+    } catch (e) {
+      console.error('Auth failed:', e.message);
+      ws.close();
+    }
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.id && pending.has(msg.id)) {
+        const { resolve, reject } = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        else resolve(msg.result);
+      }
+    } catch {}
+  });
+
+  ws.on('close', () => {
+    wsReady = false;
+    authenticated = false;
+    console.log('WebSocket closed, reconnecting in 5s...');
+    setTimeout(connect, 5000);
+  });
+
+  ws.on('error', (err) => {
+    console.error('WebSocket error:', err.message);
+  });
+}
+
+function rpcCall(method, params = []) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return reject(new Error('WebSocket not connected'));
+    }
+    const id = ++rpcId;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        reject(new Error(`RPC timeout for ${method}`));
+      }
+    }, 120000);
+  });
+}
+
+async function ensureConnected() {
+  if (wsReady && authenticated) return;
+  await new Promise((resolve, reject) => {
+    const check = setInterval(() => {
+      if (wsReady && authenticated) { clearInterval(check); resolve(); }
+    }, 200);
+    setTimeout(() => { clearInterval(check); reject(new Error('Connection timeout')); }, 15000);
+  });
+}
+
+// For job methods: call and wait for the job to complete
+async function rpcJob(method, params = []) {
+  const jobId = await rpcCall(method, params);
+  // Poll job status
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const job = await rpcCall('core.get_jobs', [[['id', '=', jobId]]]);
+    if (job && job.length > 0) {
+      const j = job[0];
+      if (j.state === 'SUCCESS') return j.result;
+      if (j.state === 'FAILED') throw new Error(j.error || 'Job failed');
+      if (j.state === 'ABORTED') throw new Error('Job aborted');
+    }
+  }
+  throw new Error('Job timeout');
 }
 
 // --- Tool definitions ---
@@ -31,7 +111,7 @@ const TOOLS = [
     name: 'app_list',
     description: 'List all TrueNAS apps with state, version, and whether an update is available.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/app'),
+    handler: () => rpcCall('app.query'),
   },
   {
     name: 'app_details',
@@ -41,7 +121,7 @@ const TOOLS = [
       properties: { app_name: { type: 'string', description: 'App name as shown in app_list' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('GET', `/app/id/${encodeURIComponent(a.app_name)}`),
+    handler: (a) => rpcCall('app.get_instance', [a.app_name]),
   },
   {
     name: 'app_start',
@@ -51,7 +131,7 @@ const TOOLS = [
       properties: { app_name: { type: 'string' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('POST', `/app/id/${encodeURIComponent(a.app_name)}/start`),
+    handler: (a) => rpcJob('app.start', [a.app_name]),
   },
   {
     name: 'app_stop',
@@ -61,7 +141,7 @@ const TOOLS = [
       properties: { app_name: { type: 'string' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('POST', `/app/id/${encodeURIComponent(a.app_name)}/stop`),
+    handler: (a) => rpcJob('app.stop', [a.app_name]),
   },
   {
     name: 'app_redeploy',
@@ -71,17 +151,20 @@ const TOOLS = [
       properties: { app_name: { type: 'string' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('POST', `/app/id/${encodeURIComponent(a.app_name)}/redeploy`),
+    handler: (a) => rpcJob('app.redeploy', [a.app_name]),
   },
   {
     name: 'app_upgrade',
     description: 'Upgrade an app to its latest available version.',
     inputSchema: {
       type: 'object',
-      properties: { app_name: { type: 'string' } },
+      properties: {
+        app_name: { type: 'string' },
+        app_version: { type: 'string', description: 'Target version, default "latest"' },
+      },
       required: ['app_name'],
     },
-    handler: (a) => truenas('POST', `/app/id/${encodeURIComponent(a.app_name)}/upgrade`),
+    handler: (a) => rpcJob('app.upgrade', [a.app_name, { app_version: a.app_version || 'latest' }]),
   },
   {
     name: 'app_delete',
@@ -91,7 +174,7 @@ const TOOLS = [
       properties: { app_name: { type: 'string' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('DELETE', `/app/id/${encodeURIComponent(a.app_name)}`),
+    handler: (a) => rpcJob('app.delete', [a.app_name]),
   },
   {
     name: 'app_config',
@@ -101,11 +184,11 @@ const TOOLS = [
       properties: { app_name: { type: 'string' } },
       required: ['app_name'],
     },
-    handler: (a) => truenas('POST', `/app/id/${encodeURIComponent(a.app_name)}/config`),
+    handler: (a) => rpcCall('app.config', [a.app_name]),
   },
   {
     name: 'app_update_config',
-    description: 'Update an app configuration. Pass the full or partial config object.',
+    description: 'Update an app configuration.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -114,13 +197,36 @@ const TOOLS = [
       },
       required: ['app_name', 'config'],
     },
-    handler: (a) => truenas('PUT', `/app/id/${encodeURIComponent(a.app_name)}`, { values: a.config }),
+    handler: (a) => rpcJob('app.update', [a.app_name, { values: a.config }]),
   },
   {
     name: 'app_available',
     description: 'List apps available to install from the catalog.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/app/available'),
+    handler: () => rpcCall('app.available'),
+  },
+  {
+    name: 'app_upgrade_summary',
+    description: 'Get upgrade summary for an app (available versions, changelog).',
+    inputSchema: {
+      type: 'object',
+      properties: { app_name: { type: 'string' } },
+      required: ['app_name'],
+    },
+    handler: (a) => rpcCall('app.upgrade_summary', [a.app_name]),
+  },
+  {
+    name: 'app_rollback',
+    description: 'Rollback an app to a previous version.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        app_name: { type: 'string' },
+        app_version: { type: 'string', description: 'Version to rollback to' },
+      },
+      required: ['app_name', 'app_version'],
+    },
+    handler: (a) => rpcJob('app.rollback', [a.app_name, { app_version: a.app_version }]),
   },
 
   // Datasets
@@ -132,8 +238,8 @@ const TOOLS = [
       properties: { pool: { type: 'string', description: 'Filter by pool name (optional)' } },
     },
     handler: (a) => {
-      const qs = a.pool ? `?pool=${encodeURIComponent(a.pool)}` : '';
-      return truenas('GET', `/pool/dataset${qs}`);
+      const filters = a.pool ? [['pool', '=', a.pool]] : [];
+      return rpcCall('pool.dataset.query', [filters]);
     },
   },
   {
@@ -144,7 +250,7 @@ const TOOLS = [
       properties: { dataset_id: { type: 'string', description: 'e.g. "media/tv"' } },
       required: ['dataset_id'],
     },
-    handler: (a) => truenas('GET', `/pool/dataset/id/${encodeURIComponent(a.dataset_id)}`),
+    handler: (a) => rpcCall('pool.dataset.get_instance', [a.dataset_id]),
   },
   {
     name: 'dataset_create',
@@ -157,7 +263,7 @@ const TOOLS = [
       },
       required: ['name'],
     },
-    handler: (a) => truenas('POST', '/pool/dataset', { name: a.name, comments: a.comments || '' }),
+    handler: (a) => rpcCall('pool.dataset.create', [{ name: a.name, comments: a.comments || '' }]),
   },
   {
     name: 'dataset_delete',
@@ -167,7 +273,7 @@ const TOOLS = [
       properties: { dataset_id: { type: 'string' } },
       required: ['dataset_id'],
     },
-    handler: (a) => truenas('DELETE', `/pool/dataset/id/${encodeURIComponent(a.dataset_id)}`),
+    handler: (a) => rpcCall('pool.dataset.delete', [a.dataset_id]),
   },
 
   // Snapshots
@@ -179,8 +285,8 @@ const TOOLS = [
       properties: { dataset: { type: 'string' } },
     },
     handler: (a) => {
-      const qs = a.dataset ? `?dataset=${encodeURIComponent(a.dataset)}` : '';
-      return truenas('GET', `/zfs/snapshot${qs}`);
+      const filters = a.dataset ? [['dataset', '=', a.dataset]] : [];
+      return rpcCall('zfs.snapshot.query', [filters]);
     },
   },
   {
@@ -195,11 +301,7 @@ const TOOLS = [
       },
       required: ['dataset', 'name'],
     },
-    handler: (a) => truenas('POST', '/zfs/snapshot', {
-      dataset: a.dataset,
-      name: a.name,
-      recursive: a.recursive || false,
-    }),
+    handler: (a) => rpcCall('zfs.snapshot.create', [{ dataset: a.dataset, name: a.name, recursive: a.recursive || false }]),
   },
   {
     name: 'snapshot_delete',
@@ -209,7 +311,7 @@ const TOOLS = [
       properties: { snapshot_id: { type: 'string', description: 'e.g. "media/tv@snap-2026"' } },
       required: ['snapshot_id'],
     },
-    handler: (a) => truenas('DELETE', `/zfs/snapshot/id/${encodeURIComponent(a.snapshot_id)}`),
+    handler: (a) => rpcCall('zfs.snapshot.delete', [a.snapshot_id]),
   },
 
   // Services
@@ -217,7 +319,7 @@ const TOOLS = [
     name: 'service_list',
     description: 'List all TrueNAS services with running state.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/service'),
+    handler: () => rpcCall('service.query'),
   },
   {
     name: 'service_start',
@@ -227,7 +329,7 @@ const TOOLS = [
       properties: { service: { type: 'string', description: 'e.g. "cifs", "nfs", "ssh"' } },
       required: ['service'],
     },
-    handler: (a) => truenas('POST', '/service/start', { service: a.service }),
+    handler: (a) => rpcCall('service.start', [a.service]),
   },
   {
     name: 'service_stop',
@@ -237,7 +339,7 @@ const TOOLS = [
       properties: { service: { type: 'string' } },
       required: ['service'],
     },
-    handler: (a) => truenas('POST', '/service/stop', { service: a.service }),
+    handler: (a) => rpcCall('service.stop', [a.service]),
   },
   {
     name: 'service_restart',
@@ -247,7 +349,7 @@ const TOOLS = [
       properties: { service: { type: 'string' } },
       required: ['service'],
     },
-    handler: (a) => truenas('POST', '/service/restart', { service: a.service }),
+    handler: (a) => rpcCall('service.restart', [a.service]),
   },
 
   // System
@@ -255,13 +357,13 @@ const TOOLS = [
     name: 'system_info',
     description: 'Get TrueNAS system information.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/system/info'),
+    handler: () => rpcCall('system.info'),
   },
   {
     name: 'system_reboot',
     description: 'Reboot the TrueNAS system. USE WITH CAUTION.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('POST', '/system/reboot'),
+    handler: () => rpcCall('system.reboot'),
   },
 
   // Shares
@@ -269,13 +371,13 @@ const TOOLS = [
     name: 'share_smb_list',
     description: 'List all SMB shares.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/sharing/smb'),
+    handler: () => rpcCall('sharing.smb.query'),
   },
   {
     name: 'share_nfs_list',
     description: 'List all NFS shares.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/sharing/nfs'),
+    handler: () => rpcCall('sharing.nfs.query'),
   },
 
   // Alerts
@@ -283,7 +385,7 @@ const TOOLS = [
     name: 'alert_list',
     description: 'List all active alerts.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/alert/list'),
+    handler: () => rpcCall('alert.list'),
   },
 
   // Pools
@@ -291,7 +393,7 @@ const TOOLS = [
     name: 'pool_list',
     description: 'List all ZFS pools.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/pool'),
+    handler: () => rpcCall('pool.query'),
   },
 
   // Disks
@@ -299,7 +401,7 @@ const TOOLS = [
     name: 'disk_list',
     description: 'List all disks.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/disk'),
+    handler: () => rpcCall('disk.query'),
   },
 
   // Cron
@@ -307,7 +409,7 @@ const TOOLS = [
     name: 'cronjob_list',
     description: 'List all cron jobs.',
     inputSchema: { type: 'object', properties: {} },
-    handler: () => truenas('GET', '/cronjob'),
+    handler: () => rpcCall('cronjob.query'),
   },
   {
     name: 'cronjob_run',
@@ -317,7 +419,7 @@ const TOOLS = [
       properties: { id: { type: 'number', description: 'Cron job ID' } },
       required: ['id'],
     },
-    handler: (a) => truenas('POST', `/cronjob/id/${a.id}/run`),
+    handler: (a) => rpcCall('cronjob.run', [a.id]),
   },
 ];
 
@@ -331,11 +433,11 @@ function checkAuth(req) {
   return header === `Bearer ${AUTH_TOKEN}`;
 }
 
-function jsonRPC(result, id) {
+function mcpResult(result, id) {
   return JSON.stringify({ jsonrpc: '2.0', result, id });
 }
 
-function jsonRPCError(code, message, id) {
+function mcpError(code, message, id) {
   return JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id });
 }
 
@@ -343,45 +445,40 @@ async function handleRPC(body) {
   const { method, params, id } = body;
 
   if (method === 'initialize') {
-    return jsonRPC({
+    return mcpResult({
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'truenas-mcp-apps', version: '1.0.0' },
+      serverInfo: { name: 'truenas-mcp-apps', version: '2.0.0' },
     }, id);
   }
 
-  if (method === 'notifications/initialized') {
-    return null;
-  }
+  if (method === 'notifications/initialized') return null;
 
   if (method === 'tools/list') {
-    return jsonRPC({
-      tools: TOOLS.map(t => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema,
-      })),
+    return mcpResult({
+      tools: TOOLS.map(t => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
     }, id);
   }
 
   if (method === 'tools/call') {
     const { name, arguments: args } = params;
     const tool = toolMap[name];
-    if (!tool) return jsonRPCError(-32601, `Unknown tool: ${name}`, id);
+    if (!tool) return mcpError(-32601, `Unknown tool: ${name}`, id);
     try {
+      await ensureConnected();
       const result = await tool.handler(args || {});
-      return jsonRPC({
+      return mcpResult({
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       }, id);
     } catch (err) {
-      return jsonRPC({
+      return mcpResult({
         content: [{ type: 'text', text: `Error: ${err.message}` }],
         isError: true,
       }, id);
     }
   }
 
-  return jsonRPCError(-32601, `Method not found: ${method}`, id);
+  return mcpError(-32601, `Method not found: ${method}`, id);
 }
 
 // --- HTTP server ---
@@ -389,7 +486,7 @@ async function handleRPC(body) {
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', tools: TOOLS.length }));
+    res.end(JSON.stringify({ status: wsReady ? 'ok' : 'connecting', authenticated, tools: TOOLS.length }));
     return;
   }
 
@@ -399,23 +496,16 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
-
     let body = '';
     for await (const chunk of req) body += chunk;
-
     try {
       const parsed = JSON.parse(body);
       const response = await handleRPC(parsed);
-      if (response === null) {
-        res.writeHead(204);
-        res.end();
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(response);
-      }
+      if (response === null) { res.writeHead(204); res.end(); }
+      else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(response); }
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(jsonRPCError(-32700, 'Parse error', null));
+      res.end(mcpError(-32700, 'Parse error', null));
     }
     return;
   }
@@ -425,8 +515,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`truenas-mcp-apps listening on :${PORT}`);
-  console.log(`TrueNAS API: ${TRUENAS_URL}`);
+  console.log(`truenas-mcp-apps v2 listening on :${PORT}`);
+  console.log(`TrueNAS: wss://${TRUENAS_HOST}/api/current`);
   console.log(`Tools: ${TOOLS.length}`);
   console.log(`Auth: ${AUTH_TOKEN ? 'enabled' : 'disabled'}`);
 });
+
+// Start WebSocket connection
+connect();
