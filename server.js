@@ -1,9 +1,38 @@
 import http from 'node:http';
 import { WebSocket } from 'ws';
 
-const TRUENAS_HOST = process.env.TRUENAS_HOST || '192.168.1.17:4545';
+const TRUENAS_HOST_RAW = process.env.TRUENAS_HOST || '192.168.1.17:4545';
 const TRUENAS_API_KEY = process.env.TRUENAS_API_KEY || '';
+const TRUENAS_USERNAME = process.env.TRUENAS_USERNAME || '';
+const TRUENAS_PASSWORD = process.env.TRUENAS_PASSWORD || '';
 const TRUENAS_INSECURE = process.env.TRUENAS_INSECURE === 'true';
+
+// Transport selection.
+// TRUENAS_HOST may be a bare "host:port" or carry a scheme:
+//   https:// or wss://  -> encrypted WebSocket (wss)
+//   http://  or ws://   -> plain WebSocket (ws)
+// TRUENAS_PROTOCOL (ws | wss | http | https) overrides the scheme. Default: wss.
+function resolveTransport(raw, override) {
+  const m = /^(https?|wss?):\/\//i.exec(raw);
+  const host = (m ? raw.slice(m[0].length) : raw).replace(/\/+$/, '');
+  const scheme = (override || (m && m[1]) || 'wss').toLowerCase();
+  if (!['ws', 'wss', 'http', 'https'].includes(scheme)) {
+    throw new Error(`Invalid TRUENAS_PROTOCOL "${scheme}" (expected ws, wss, http or https)`);
+  }
+  const secure = scheme === 'wss' || scheme === 'https';
+  return { host, secure, url: `${secure ? 'wss' : 'ws'}://${host}/api/current` };
+}
+const TRANSPORT = resolveTransport(TRUENAS_HOST_RAW, process.env.TRUENAS_PROTOCOL);
+const TRUENAS_HOST = TRANSPORT.host;
+const TRUENAS_URL = TRANSPORT.url;
+
+if (!TRANSPORT.secure) {
+  console.warn('WARNING: plain HTTP/WebSocket transport (ws://). Credentials are sent unencrypted.');
+  if (TRUENAS_API_KEY && !(TRUENAS_USERNAME && TRUENAS_PASSWORD)) {
+    console.warn('WARNING: TrueNAS 25.04+ automatically revokes API keys used over an insecure connection. ' +
+      'Enable HTTPS on TrueNAS, or set TRUENAS_USERNAME/TRUENAS_PASSWORD instead of TRUENAS_API_KEY.');
+  }
+}
 const PORT = Number(process.env.PORT) || 3004;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
@@ -22,14 +51,20 @@ const pending = new Map();
 let authenticated = false;
 
 function connect() {
-  const url = `wss://${TRUENAS_HOST}/api/current`;
+  const url = TRUENAS_URL;
   console.log(`Connecting to ${url}`);
-  ws = new WebSocket(url, { rejectUnauthorized: !TRUENAS_INSECURE });
+  ws = new WebSocket(url, TRANSPORT.secure ? { rejectUnauthorized: !TRUENAS_INSECURE } : {});
 
   ws.on('open', async () => {
     console.log('WebSocket connected, authenticating...');
     try {
-      await rpcCall('auth.login_with_api_key', [TRUENAS_API_KEY]);
+      let ok;
+      if (TRUENAS_USERNAME && TRUENAS_PASSWORD) {
+        ok = await rpcCall('auth.login', [TRUENAS_USERNAME, TRUENAS_PASSWORD]);
+      } else {
+        ok = await rpcCall('auth.login_with_api_key', [TRUENAS_API_KEY]);
+      }
+      if (ok === false) throw new Error('invalid credentials');
       authenticated = true;
       wsReady = true;
       console.log('Authenticated successfully');
@@ -60,6 +95,10 @@ function connect() {
 
   ws.on('error', (err) => {
     console.error('WebSocket error:', err.message);
+    if (TRANSPORT.secure && /wrong version number|EPROTO/i.test(err.message)) {
+      console.error(`Hint: ${TRUENAS_HOST} does not speak TLS. If TrueNAS only serves HTTP on this port, ` +
+        'set TRUENAS_PROTOCOL=ws (or TRUENAS_HOST=http://host:port), or point TRUENAS_HOST at its HTTPS port.');
+    }
   });
 }
 
@@ -525,7 +564,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`truenas-mcp-apps v2 listening on :${PORT}`);
-  console.log(`TrueNAS: wss://${TRUENAS_HOST}/api/current`);
+  console.log(`TrueNAS: ${TRUENAS_URL}`);
+  console.log(`TrueNAS auth: ${TRUENAS_USERNAME && TRUENAS_PASSWORD ? 'username/password' : 'API key'}`);
   console.log(`Tools: ${TOOLS.length}`);
   console.log(`Auth: ${AUTH_TOKEN ? 'enabled' : 'disabled'}`);
 });
