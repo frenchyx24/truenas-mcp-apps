@@ -50,6 +50,23 @@ let rpcId = 0;
 const pending = new Map();
 let authenticated = false;
 
+// TrueNAS closes idle WebSocket sessions after about 60 seconds.
+// Send an application-level core.ping regularly to keep the session alive.
+const KEEPALIVE_MS = Number(process.env.TRUENAS_KEEPALIVE_MS) || 30000;
+let keepaliveTimer = null;
+
+function startKeepalive() {
+  stopKeepalive();
+  keepaliveTimer = setInterval(() => {
+    rpcCall('core.ping').catch((e) => console.error('Keepalive ping failed:', e.message));
+  }, KEEPALIVE_MS);
+}
+
+function stopKeepalive() {
+  if (keepaliveTimer) clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
 function connect() {
   const url = TRUENAS_URL;
   console.log(`Connecting to ${url}`);
@@ -68,6 +85,7 @@ function connect() {
       authenticated = true;
       wsReady = true;
       console.log('Authenticated successfully');
+      startKeepalive();
     } catch (e) {
       console.error('Auth failed:', e.message);
       ws.close();
@@ -87,6 +105,7 @@ function connect() {
   });
 
   ws.on('close', () => {
+    stopKeepalive();
     wsReady = false;
     authenticated = false;
     console.log('WebSocket closed, reconnecting in 5s...');
