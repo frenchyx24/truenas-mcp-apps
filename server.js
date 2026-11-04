@@ -259,7 +259,20 @@ const TOOLS = [
       },
       required: ['app_name', 'config'],
     },
-    handler: (a) => rpcJob('app.update', [a.app_name, { values: a.config }]),
+    handler: async (a) => {
+      const app = await rpcCall('app.get_instance', [a.app_name]);
+      let update;
+      if (app?.custom_app) {
+        if (typeof a.config?.custom_compose_config_string === 'string') {
+          update = { custom_compose_config_string: a.config.custom_compose_config_string };
+        } else {
+          update = { custom_compose_config: a.config?.custom_compose_config ?? a.config };
+        }
+      } else {
+        update = { values: a.config };
+      }
+      return rpcJob('app.update', [a.app_name, update]);
+    },
   },
   {
     name: 'app_available',
